@@ -151,7 +151,9 @@ const spec = {
       '**Auth**: most endpoints require a Bearer JWT obtained from `POST /auth/login`. ' +
       'Click the `Authorize` button (top-right) and paste the token to try secured endpoints from this UI.',
   },
-  servers: [{ url: 'http://localhost:3000', description: 'Local dev' }],
+  // Relative URL — Swagger UI uses whatever origin it was loaded from, so this
+  // works in both local dev and production (Render) with zero env config.
+  servers: [{ url: '/', description: 'Current host' }],
   components: {
     securitySchemes: {
       bearerAuth: {
