@@ -1,0 +1,369 @@
+================================================================================
+Content Broadcasting System — Architecture Notes
+================================================================================
+
+This file explains *why* the code is shaped the way it is. The README covers
+*what* each endpoint does.
+
+--------------------------------------------------------------------------------
+1. Authentication & Role-Based Access Control (RBAC)
+--------------------------------------------------------------------------------
+
+Flow:
+  client → POST /auth/login → server bcrypt-compares hash → server signs JWT
+  client → subsequent requests carry "Authorization: Bearer <token>"
+  server → authMiddleware verifies signature, attaches req.user
+  server → roleMiddleware (where applicable) checks req.user.role
+
+Why JWT (not server-side sessions)?
+  Stateless — no DB lookup per request, so the public broadcasting layer
+  stays fast and the API can scale horizontally without sticky sessions.
+
+Why one users table for both roles?
+  The two roles share name/email/password fields. Splitting them would
+  duplicate auth logic. A CHECK constraint at the DB plus role-aware
+  middleware is simpler and safer (defence in depth).
+
+JWT payload:
+  { sub: <uuid>, role: 'teacher'|'principal', email: ... }
+  `sub` is the standard JWT subject claim — the user's id.
+
+Generic auth errors:
+  /auth/login returns the same 401 message for "no such email" and
+  "wrong password" — distinguishing them would let attackers enumerate
+  accounts.
+
+Login is also rate-limited (5 / 15 min / IP) — see §9.
+
+--------------------------------------------------------------------------------
+2. Subject-based system design
+--------------------------------------------------------------------------------
+
+Subjects are the unit of rotation. A teacher might have content for
+"maths", "science", and "history" all live at once; the live endpoint
+returns the active item per subject.
+
+Implementation:
+  - `subject` on `content` is the canonical name (lower-cased in the
+    service layer so "Maths" / "maths" share a slot).
+  - `content_slots` is the registry of distinct subjects that have ever
+    been scheduled. One row per subject, kept distinct via a UNIQUE.
+  - `content_schedules` joins each approved content row to its slot
+    with `rotation_order` and `duration` (minutes).
+
+Why a separate slots/schedules pair instead of just sorting `content`?
+  Separates "the content" from "its place in the carousel". Future
+  features ("re-order this subject", "school-wide announcements as a
+  cross-teacher slot") become single UPDATEs/INSERTs on the schedule
+  table without touching content rows.
+
+In the current scheduling implementation we read straight from `content`
+(via findLiveCandidates) because that gives us start_time/end_time/
+rotation_duration in one query. The slot/schedule rows are still
+populated atomically on approval as the source of truth for rotation
+membership and would be the read source if/when we move to multi-teacher
+slots.
+
+--------------------------------------------------------------------------------
+3. Upload handling (AWS S3)
+--------------------------------------------------------------------------------
+
+Storage: AWS S3 (private bucket). Local disk holds nothing for new uploads.
+
+Pipeline:
+  request (multipart/form-data)
+    → multer.memoryStorage()           validates mimetype + 10MB cap
+    → validateFile()                   defence-in-depth size/extension check
+    → validate(uploadBody, 'body')     Joi: title/subject/start_time/...
+    → contentService.upload():
+         key = `content/<uuid>.<ext>`  UUID-based key, no leading slash
+         s3.uploadBuffer(key, file.buffer, mimetype)
+         contentModel.insert({ ..., file_url: key })
+         If the DB INSERT throws AFTER the S3 PUT, the service calls
+         s3.deleteObject(key) so we never leak orphan blobs.
+
+Why memoryStorage + manual S3 PUT (instead of multer-s3)?
+  - We perform the S3 PUT only after Joi has validated everything else.
+  - Cleanup-on-DB-failure is one line in the catch block (mirrors what
+    the legacy disk implementation did with fs.unlink).
+  - One less dependency to track for vulnerabilities.
+
+Why a private bucket + presigned URLs (instead of public bucket)?
+  - Block-public-access is the safe default at AWS.
+  - Presigned URLs expire (default 1h, AWS_PRESIGN_TTL_SECONDS). A URL
+    leaked in a screenshot stops working. A public URL would not.
+  - Presigning is local HMAC — no S3 round-trip, fast on the read path.
+
+What gets stored in DB:
+  Just the S3 key (e.g. "content/3f2a-...-jpg"). NOT a URL.
+  At read time the service maps the key → presigned GET URL via
+  utils/presignHelper.js. That helper recognises three shapes:
+     "/uploads/..."   → returned as-is (legacy local-disk content;
+                        served by app.js's static handler)
+     "http(s)://..."  → returned as-is (already absolute)
+     anything else    → treated as an S3 key, presigned with TTL
+
+This means existing DB rows from the pre-S3 phase keep working — the
+"/uploads" static handler is preserved purely as a legacy escape hatch.
+
+IAM permissions required on the bucket:
+  s3:PutObject, s3:GetObject, s3:DeleteObject
+on the key prefix that holds content (e.g. arn:aws:s3:::<bucket>/content/*).
+
+--------------------------------------------------------------------------------
+4. Approval workflow
+--------------------------------------------------------------------------------
+
+Pending → Approved or Rejected. ONE-WAY. Enforced in SQL via:
+
+  UPDATE content
+  SET ... WHERE id = $1 AND status = 'pending'
+
+If status is no longer 'pending' the UPDATE returns 0 rows; the service
+distinguishes "missing" vs "wrong status" via a follow-up read and
+returns 404 or 400 accordingly.
+
+Atomicity:
+  Approving has THREE side effects (content row, slot row, schedule
+  row). They run inside a single BEGIN/COMMIT in approvalService.approve.
+  Any failure → ROLLBACK → no half-written state.
+
+Why ON CONFLICT for the slot insert?
+  Two principals approving "maths" content simultaneously would race a
+  SELECT-then-INSERT. ON CONFLICT (subject) DO UPDATE is idempotent and
+  safe under concurrency.
+
+Why MAX(rotation_order)+1 inside the schedule INSERT?
+  Same reason. Computing the next order in app code allows two parallel
+  approvals to land on the same rotation_order; computing it inside the
+  INSERT removes the race.
+
+--------------------------------------------------------------------------------
+5. Scheduling / rotation algorithm (VERY IMPORTANT)
+--------------------------------------------------------------------------------
+
+Inputs (per teacher, per subject):
+  Approved content rows where  start_time <= NOW() <= end_time
+
+Steps:
+  1. total_cycle_minutes = sum(rotation_duration)
+  2. earliest_start      = min(start_time)
+  3. elapsed_minutes     = (NOW - earliest_start) / 60_000
+  4. position            = elapsed_minutes mod total_cycle_minutes
+  5. Walk items in createdAt-asc order, accumulating durations into
+     `cumulative`. The first item where position < cumulative is on air.
+
+Worked example:
+  3 items, 5 min each → total_cycle = 15.
+  At 7 min elapsed, position = 7. Walk:
+    item A: cumulative = 5,  is 7<5?  no
+    item B: cumulative = 10, is 7<10? yes → item B is on air
+
+Why anchor on the EARLIEST start_time?
+  - Stable phase. Two requests one second apart see the same offset.
+  - Doesn't jump when new content joins later — existing items stay
+    phase-stable for currently-watching students.
+
+Edge cases the algorithm handles:
+  - No live candidates → []. The controller maps that to
+    { success:true, message:"No content available", data:[] }.
+  - total_cycle == 0 → null (defensive; DB defaults rotation_duration=5).
+  - Floating-point boundary fall-through → falls back to last item.
+
+The algorithm is implemented as a pure function (pickActiveForSubject)
+exported for unit testing.
+
+--------------------------------------------------------------------------------
+6. Database design decisions
+--------------------------------------------------------------------------------
+
+- UUIDs everywhere — merge-safe across deployments, ids reveal nothing.
+- ON DELETE CASCADE from content_schedules → content/slots so cleanup
+  cascades naturally.
+- ON DELETE SET NULL on content.approved_by — deleting a principal user
+  does not delete the historical approval decisions they made.
+- Indexes on the actual hot queries:
+    idx_content_uploaded_by      /content/my-content
+    idx_content_live_window      /content/live (composite covering
+                                  uploaded_by + status + start_time + end_time)
+    idx_schedules_slot           rotation reads
+- CHECK constraints on role, status, file_type — defence in depth.
+
+--------------------------------------------------------------------------------
+7. Folder structure
+--------------------------------------------------------------------------------
+
+routes/        validation chain + auth/role middleware mounting only
+controllers/   parse req → call service → format response
+services/      business rules, transactions, multi-model orchestration
+models/        raw SQL — and only raw SQL
+middlewares/   cross-cutting concerns (auth, role, multer, validate, errors)
+config/        external-system clients (pg pool, S3, OpenAPI spec)
+utils/         pure helpers, Joi schemas, presigning helper, constants
+
+Goal: any future developer adding a new endpoint touches at most one
+file per layer. There is exactly one place to look for "how is rotation
+computed" (services/schedulingService.js) or "how is content read"
+(models/contentModel.js).
+
+--------------------------------------------------------------------------------
+8. Middleware usage
+--------------------------------------------------------------------------------
+
+Global (in app.js, before routes):
+  cors                  open CORS so school websites/apps can call the API
+  express.json          parses application/json bodies
+  express.urlencoded    parses form posts
+  morgan                request logging (combined in prod, dev locally)
+  /uploads              express.static for legacy local-disk content
+  /api-docs             swagger-ui-express browseable docs
+  /api-docs.json        raw OpenAPI 3.0 spec
+
+Per-route:
+  authenticate          JWT verification, attaches req.user
+  requireRole(...)      RBAC gate (returns 403 with the allowed roles listed)
+  uploadSingle('file')  multer wrapper that rewrites size/type errors
+                        into our standard JSON envelope
+  validateFile()        post-multer file size/extension guard
+  validate(schema, …)   Joi-driven body/query/params validator (factory)
+
+Last:
+  notFoundHandler       404 envelope for unmatched routes
+  errorHandler          translates AppError, Joi errors, pg unique-violation
+                        (23505 → 409) / FK-violation (23503 → 400) /
+                        invalid_text (22P02 → 400), JWT errors (→ 401),
+                        body-parser malformed JSON / oversize. Logs full
+                        error server-side; never leaks stack traces.
+
+--------------------------------------------------------------------------------
+9. Rate limiting
+--------------------------------------------------------------------------------
+
+express-rate-limit, mounted on:
+  /auth/login            5  / 15 min / IP   — brute-force defence
+  /content/live/...      100 / 15 min / IP  — public abuse defence
+
+In production, swap the in-memory store for rate-limit-redis so multiple
+Node instances share counters.
+
+--------------------------------------------------------------------------------
+10. Pagination & filters
+--------------------------------------------------------------------------------
+
+Listing endpoints accept ?page=&limit= (default 1/10, hard cap 100).
+Models run COUNT(*) alongside the paged SELECT so the response can
+include:
+
+  { data:[...], pagination:{ currentPage, totalPages, totalItems, limit } }
+
+Filters supported:
+  /content/my-content       ?status= ?subject=
+  /approval/all             ?status= ?subject= ?teacher=
+  /approval/pending         ?subject= ?teacher=
+
+For very large tables COUNT(*) becomes a hot spot; we'd then switch to
+keyset pagination (?after=<created_at>) and drop totalItems.
+
+--------------------------------------------------------------------------------
+11. Validation
+--------------------------------------------------------------------------------
+
+Joi (utils/schemas.js) is the single source of truth.
+A factory in middlewares/validateMiddleware.js applies a schema to
+body / query / params with:
+  abortEarly: false       all field errors reported in one shot
+  convert: true           coerces "1" → 1, ISO string → Date
+  stripUnknown: true      drops unknown keys (mass-assignment defence)
+
+Failures return 400 with field-level details:
+  { success:false, message:"Validation failed",
+    data:[ { field:"email", message:"…" } ] }
+
+--------------------------------------------------------------------------------
+12. Process-level safety nets
+--------------------------------------------------------------------------------
+
+app.js wires:
+  unhandledRejection / uncaughtException → log and graceful-shutdown
+  SIGTERM / SIGINT                       → graceful-shutdown
+Graceful shutdown closes the HTTP server, drains the pg pool, and has a
+hard 10s deadline so a stuck pool drain never blocks the orchestrator.
+
+assertRequiredEnv() at boot fails fast if any of JWT_SECRET, DB_*, or
+AWS_* is missing — silent defaults in prod = security bug.
+
+--------------------------------------------------------------------------------
+13. Scalability — future improvements
+--------------------------------------------------------------------------------
+
+(a) Redis caching for /content/live/:teacherId
+
+    The live endpoint is the read-hot path: every student polling for
+    the current slide. Despite that, its output only changes:
+       - when a content's air-window crosses NOW (start or end), or
+       - when content is approved / rejected for that teacher, or
+       - at every rotation boundary (every rotation_duration minutes).
+
+    Caching strategy:
+       Key:   live:<teacherId>:<subjectOrAll>
+       Value: JSON envelope returned to the client
+       TTL:   min(rotation_duration across active items for that teacher),
+              clamped to a sensible floor (≥ 30s) so we don't thrash.
+
+    Cache invalidation triggers (write-through DEL):
+       - approval/approve and approval/reject for that teacher
+       - any content row whose air-window starts/ends — a tiny scheduled
+         job every minute scans for boundary crossings and DELs affected
+         keys.
+
+    Concretely with ioredis:
+       const cached = await redis.get(key);
+       if (cached) return JSON.parse(cached);
+       const data = await schedulingService.getLiveContentForTeacher(...);
+       await redis.set(key, JSON.stringify(data), 'EX', ttlSeconds);
+
+    Hot teachers go from a JOIN per request to a single Redis GET.
+
+    Note: presigned URLs would need to be regenerated on cache MISS but
+    cached as-is; the URL TTL must remain longer than the cache TTL or
+    we'd serve expired URLs. With AWS_PRESIGN_TTL_SECONDS=3600 and a
+    cache TTL of a few minutes this gap is comfortable.
+
+(b) Message queues for fan-out work
+
+    Two natural queue boundaries:
+       - "content approved" event → published to SNS/SQS/Kafka so future
+         consumers (notification service emailing the teacher,
+         search-indexer, analytics warehouse loader) can subscribe
+         without coupling to this service.
+       - File-processing queue: virus scan, image resize for thumbnails,
+         OCR for searchable text — out-of-band work so the API stays
+         snappy.
+
+(c) Horizontal scaling notes
+
+    The API is stateless — N replicas behind a load balancer with sticky
+    sessions disabled. Two state-y bits to remember:
+       - express-rate-limit's memory store is per-instance — switch to
+         rate-limit-redis to share counters.
+       - Local /uploads/ is legacy only; new uploads go to S3 already.
+
+(d) Observability
+
+    morgan handles request logs today. In production add:
+       - structured JSON logs (pino) into your log pipeline
+       - Prometheus metrics (prom-client): http_requests_total,
+         scheduling_picks_total{subject}, s3_upload_size_bytes
+       - opentelemetry traces — especially around pool.query and S3 PUT
+         calls so slow operations are findable.
+
+(e) CDN in front of S3 (later)
+
+    For very public broadcasts, front the bucket with CloudFront and a
+    long Cache-Control TTL, then skip presigning entirely for that
+    audience. For internal school content, presigned URLs strike the
+    right balance between privacy and economics.
+
+--------------------------------------------------------------------------------
+End of architecture notes.
+--------------------------------------------------------------------------------
